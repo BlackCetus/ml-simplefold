@@ -59,6 +59,20 @@ class Resource:
 
     def get(self, key: str) -> Any:
         """Get an item from the Redis database."""
+        import os
+        if not hasattr(self, '_assigned_pid') or self._assigned_pid != os.getpid():
+            conn_kwargs = self._redis.connection_pool.connection_kwargs
+            
+            # Extract ONLY the clean connection parameters, stripping internal pool arguments
+            self._redis = Redis(
+                host=conn_kwargs.get('host', 'localhost'),
+                port=conn_kwargs.get('port', 6379),
+                db=conn_kwargs.get('db', 0),
+                password=conn_kwargs.get('password', None),
+                username=conn_kwargs.get('username', None)
+            )
+            self._assigned_pid = os.getpid()
+
         value = self._redis.get(key)
         if value is not None:
             value = pickle.loads(value)

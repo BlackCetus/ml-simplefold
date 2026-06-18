@@ -123,10 +123,15 @@ class SimpleFold(pl.LightningModule):
 
         self.use_esm = esm_model is not None
         if self.use_esm:
-            self.esm_model, self.esm_dict = esm_registry[esm_model]()
-            self.esm_model.eval()
-            self.af2_to_esm = _af2_to_esm(self.esm_dict)
-            print(f"Using ESM model: {esm_model}")
+            # Load wrapper instead
+            self.plm_adapter = esm_registry[esm_model]()
+            self.plm_adapter.model.eval()
+            
+            # Map parameters smoothly to their original tracking names
+            self.esm_model = self.plm_adapter
+            self.af2_to_esm = self.plm_adapter.get_af2_to_plm_mapping()
+            self.esm_dict = self.plm_adapter.tokenizer
+            print(f"Using Abstract PLM Adapter for: {esm_model}")
         else:
             self.esm_model = None
             self.esm_dict = None
@@ -612,9 +617,11 @@ class SimpleFold(pl.LightningModule):
         return
 
     def reset_esm(self, esm_model: str):
-        self.esm_model, self.esm_dict = esm_registry[esm_model]()
+        self.plm_adapter = esm_registry[esm_model]()
+        self.esm_model = self.plm_adapter
+        self.esm_dict = self.plm_adapter.tokenizer
         self.esm_model.eval()
-        self.af2_to_esm = _af2_to_esm(self.esm_dict)
+        self.af2_to_esm = self.plm_adapter.get_af2_to_plm_mapping()
         self.esm_model = self.esm_model.to(self.device)
         self.af2_to_esm = self.af2_to_esm.to(self.device)
         print(f"Successfully reset ESM model {esm_model}")
@@ -646,10 +653,11 @@ class SimpleFold(pl.LightningModule):
                     self.esm_model.eval()
                     # Wrap each layer in FSDP separately
                     for name, child in self.esm_model.named_children():
-                        if name == "layers":
-                            for layer_name, layer in child.named_children():
+                        if name in ("layers", "encoder", "transformer"): ## TODO: adjust the wrapping to correctly work for other plms (allow/specify layer names in if statement)
+                            target_blocks = getattr(child, "block", child)
+                            for layer_name, layer in target_blocks.named_children():
                                 wrapped_layer = wrap(layer)
-                                setattr(child, layer_name, wrapped_layer)
+                                setattr(target_blocks, layer_name, wrapped_layer)            
                     self.esm_model = wrap(self.esm_model)
                 self.af2_to_esm = self.af2_to_esm.to(self.device)
             else:
@@ -660,14 +668,17 @@ class SimpleFold(pl.LightningModule):
             self.training_gpus = self.trainer.world_size
             self.hparams["training_gpus"] = self.training_gpus
 
+            print(f"[Rank {self.trainer.global_rank}] Fetching first batch...", flush=True)
             batch = next(iter(self.trainer.datamodule.train_dataloader()))
 
+            print(f"[Rank {self.trainer.global_rank}] Running PLM dummy pass...", flush=True)
             batch = self.processor.preprocess_training(
                 batch,
                 self.esm_model,
                 self.esm_dict,
                 self.af2_to_esm,
             )
+            print(f"[Rank {self.trainer.global_rank}] Setup complete!", flush=True)
             y = batch["coords"]
             t = torch.zeros((y.shape[0])).cuda()
 

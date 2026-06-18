@@ -56,8 +56,10 @@ class ProteinDataProcessor:
         L = batch["res_type"].shape[1]
         num_tokens = batch["cropped_num_tokens"]
 
+        chain_linker = esm_model.chain_linker if esm_model is not None else "G" * 25
+
         aatype, mask, residx, linker_mask, _ = batch_encode_sequences(
-            sequence, residue_index_offset=512, chain_linker="G" * 25,
+            sequence, residue_index_offset=512, chain_linker=chain_linker,
         )
 
         aatype, mask, residx, linker_mask = map(

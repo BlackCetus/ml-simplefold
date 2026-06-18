@@ -4,6 +4,17 @@
 #
 
 import torch
+# Force the modern API to set a uniform precision state
+torch.set_float32_matmul_precision('high')
+
+# Safe fallback monkeypatch to prevent the internal framework crash
+_orig_get_precision = torch.get_float32_matmul_precision
+def _safe_get_precision():
+    try:
+        return _orig_get_precision()
+    except RuntimeError:
+        return "high"
+torch.get_float32_matmul_precision = _safe_get_precision
 import lightning.pytorch as pl
 from lightning.pytorch import LightningDataModule, LightningModule
 import hydra

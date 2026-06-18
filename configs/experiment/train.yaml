@@ -11,7 +11,7 @@
 # - /trainer: [default, fsdp]
 
 defaults:
-  - override /data: pdb
+  - override /data: pdb_sp_1k
   - override /model: simplefold
   - override /model/architecture: foldingdit_100M
   - override /model/sampler: euler_maruyama
@@ -29,14 +29,14 @@ trainer:
   accumulate_grad_batches: 1 # gradient accumulation
 
 data:
-  batch_size: 1 # should be the same as the number of GPUs
-  num_workers: 16
+  batch_size: 4 # should be the same as the number of GPUs
+  num_workers: 0
 
 model:
   _target_: model.simplefold.SimpleFold
   ema_decay: 0.999
   clip_grad_norm_val: 2.0
-  esm_model: "esm2_3B"
+  esm_model: "prot_t5"
   lddt_weight_schedule: False # set to True in finetuning phase
 
   scheduler:

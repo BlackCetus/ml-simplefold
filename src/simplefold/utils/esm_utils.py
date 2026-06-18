@@ -10,6 +10,10 @@ import torch
 import typing as T
 import numpy as np
 from functools import partial
+import abc
+import urllib.request
+
+from transformers import T5Tokenizer, T5EncoderModel
 
 from utils import residue_constants
 
@@ -18,8 +22,41 @@ try:
 except:
     pass
 
+
+def load_wrapped_esm2(model_key):
+    # Fetch raw model and dict from Meta's Hub
+    raw_model, raw_dict = esm_registry_raw[model_key]()
+    meta = esm_model_dict[model_key]
+    
+    # Wrap it nicely
+    return ESM2Backbone(
+        model=raw_model, 
+        tokenizer=raw_dict, 
+        s_dim=meta["esm_s_dim"], 
+        z_dim=meta["esm_z_dim"], 
+        num_layers=meta["esm_num_layers"]-1
+    )
+
+def load_wrapped_prott5(model_key):
+    internet = None
+    try:
+        urllib.request.urlopen('https://huggingface.co', timeout=2)
+        internet = True
+    except (urllib.error.URLError, TimeoutError):
+        internet = False
+    model_key = model_key if internet else hf_offline_paths[model_key]
+    tokenizer = T5Tokenizer.from_pretrained(model_key)
+    model = T5EncoderModel.from_pretrained(model_key)
+    return ProtT5Backbone(
+        model=model, 
+        tokenizer=tokenizer, 
+        s_dim=model.config.d_model, 
+        z_dim=model.config.d_model, 
+        num_layers=model.config.num_layers)
+
+
 load_fn = torch.hub.load
-esm_registry = {
+esm_registry_raw = {
     "esm2_8M": partial(load_fn, "facebookresearch/esm:main", "esm2_t6_8M_UR50D"),
     "esm2_35M": partial(load_fn, "facebookresearch/esm:main", "esm2_t12_35M_UR50D"),
     "esm2_150M": partial(load_fn, "facebookresearch/esm:main", "esm2_t30_150M_UR50D"),
@@ -28,6 +65,21 @@ esm_registry = {
     "esm2_15B": partial(load_fn, "facebookresearch/esm:main", "esm2_t48_15B_UR50D"),
 }
 
+
+
+esm_registry = {
+    "esm2_8M": partial(load_wrapped_esm2, "esm2_8M"),
+    "esm2_35M": partial(load_wrapped_esm2, "esm2_35M"),
+    "esm2_150M": partial(load_wrapped_esm2, "esm2_150M"),
+    "esm2_650M": partial(load_wrapped_esm2, "esm2_650M"),
+    "esm2_3B":   partial(load_wrapped_esm2, "esm2_3B"),
+    "esm2_15B":  partial(load_wrapped_esm2, "esm2_15B"),
+    "prot_t5": partial(load_wrapped_prott5, "Rostlab/prot_t5_xl_bfd"),
+}
+
+hf_offline_paths = {
+    "Rostlab/prot_t5_xl_bfd": "/e/project1/crescendo/reim1/.cache/hf-cache/models--Rostlab--prot_t5_xl_bfd/snapshots/7ae1d5c1d148d6c65c7e294cc72807e5b454fdb7",
+}
 
 esm_model_dict = {
     "esm2_8M": {
@@ -59,6 +111,11 @@ esm_model_dict = {
         "esm_s_dim": 5120,
         "esm_z_dim": 1920,
         "esm_num_layers": 49,
+    },
+    "prot_t5": {
+        "esm_s_dim": 1024,
+        "esm_z_dim": 768,
+        "esm_num_layers": 25,
     },
 }
 
@@ -182,7 +239,7 @@ def af2_idx_to_esm_idx(aa, mask, af2_to_esm):
     return af2_to_esm[aa]
 
 
-def compute_language_model_representations(
+def compute_language_model_representations_old(
     esmaa, esm, esm_dict, backend="torch"
 ) -> torch.Tensor:
     """Adds bos/eos tokens for the language model, since the structure module doesn't use these."""
@@ -211,3 +268,114 @@ def compute_language_model_representations(
     )
     esm_s = esm_s[:, 1:-1]  # B, L, nLayers, C
     return esm_s, None
+
+def compute_language_model_representations(
+    esmaa, esm_adapter, esm_dict=None, backend="torch"
+) -> torch.Tensor:
+    """
+    This function intercepts the hardcoded call from protein_processor.py.
+    Instead of doing ESM-specific math, it just passes the tokens into our wrapper.
+    """
+    # In PyTorch, calling an object like a function triggers its forward() method!
+    esm_s = esm_adapter(esmaa) 
+    
+    return esm_s, None
+
+class BasePLMBackbone(abc.ABC, torch.nn.Module):
+    """
+    Unified contract interface. Every new language model family will implement 
+    this subclass, hiding model-specific token/tensor quirks from SimpleFold.
+    """
+    def __init__(self, model, tokenizer, s_dim, z_dim, num_layers):
+        super().__init__()
+        self.model = model
+        self.tokenizer = tokenizer
+        self.s_dim = s_dim
+        self.z_dim = z_dim
+        self.num_layers = num_layers
+
+    @abc.abstractmethod
+    def get_af2_to_plm_mapping(self) -> torch.Tensor:
+        """Returns the tensor used to remap AlphaFold amino acid indices to PLM tokens."""
+        pass
+
+    @abc.abstractmethod
+    def forward(self, esmaa: torch.Tensor) -> torch.Tensor:
+        """Performs forward pass and returns exactly: [B, L, nLayers, C]"""
+        pass
+
+    @property 
+    def chain_linker(self) -> str:
+        """String used to separate chains in multimer predictions."""
+        return ""
+
+
+class ESM2Backbone(BasePLMBackbone):
+    """Adapter wrapping Meta's original ESM-2 models natively."""
+    def get_af2_to_plm_mapping(self) -> torch.Tensor:
+        esm_reorder = [self.tokenizer.padding_idx] + [
+            self.tokenizer.get_idx(v) for v in residue_constants.restypes_with_x
+        ]
+        return torch.tensor(esm_reorder)
+
+    def forward(self, esmaa: torch.Tensor) -> torch.Tensor:
+        batch_size = esmaa.size(0)
+        bos = esmaa.new_full((batch_size, 1), self.tokenizer.cls_idx)
+        eos = esmaa.new_full((batch_size, 1), self.tokenizer.padding_idx)
+        esmaa = torch.cat([bos, esmaa, eos], dim=1)
+        esmaa[range(batch_size), (esmaa != 1).sum(1)] = self.tokenizer.eos_idx
+
+        res = self.model(esmaa, repr_layers=range(self.num_layers + 1), need_head_weights=False)
+        esm_s = torch.stack([v for _, v in sorted(res["representations"].items())], dim=2)
+        return esm_s[:, 1:-1] # Slice off BOS/EOS -> [B, L, Layers, Dim]
+    
+    @property
+    def chain_linker(self) -> str:
+        # ESM requires 25 Glycines to separate multimer chains in RoPE space
+        return "G" * 25
+
+class ProtT5Backbone(BasePLMBackbone):
+    """Adapter for ProtT5 models."""
+    def get_af2_to_plm_mapping(self) -> torch.Tensor:
+        # ProtT5 uses pad_token_id for padding and convert_tokens_to_ids for vocab mapping
+        prott5_reorder = [self.tokenizer.pad_token_id] + [
+            self.tokenizer.convert_tokens_to_ids(v) for v in residue_constants.restypes_with_x
+        ]
+        return torch.tensor(prott5_reorder)
+
+    def forward(self, t5aa: torch.Tensor) -> torch.Tensor:
+        batch_size = t5aa.size(0)
+        
+        pad_col = t5aa.new_full((batch_size, 1), self.tokenizer.pad_token_id)
+        t5aa = torch.cat([t5aa, pad_col], dim=1)
+
+        # 2. Insert the EOS token exactly at the end of the valid sequence
+        seq_lengths = (t5aa != self.tokenizer.pad_token_id).sum(1)
+        t5aa[range(batch_size), seq_lengths] = self.tokenizer.eos_token_id
+
+        # 3. Create the attention mask (Crucial for T5 to ignore padding)
+        attention_mask = (t5aa != self.tokenizer.pad_token_id).long()
+
+        # 4. Forward pass requesting hidden states from all layers
+        res = self.model(
+            input_ids=t5aa,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True
+        )
+
+        # 5. Stack the hidden states
+        # res.hidden_states is a tuple of length 25 (embedding layer + 24 hidden layers)
+        t5_s = torch.stack(res.hidden_states, dim=2)
+
+        # 6. Slice off the appended column
+        # Because there is no BOS token, we slice `:-1` instead of `1:-1`
+        return t5_s[:, :-1] # -> [B, L, Layers, Dim]
+
+    @property
+    def chain_linker(self) -> str:
+        # ProtT5 processes the sequence continuously without dummy amino acids
+        return ""
+
+
+
