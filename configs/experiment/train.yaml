@@ -11,7 +11,7 @@
 # - /trainer: [default, fsdp]
 
 defaults:
-  - override /data: pdb_sp_1k
+  - override /data: pdb_sp_afesme
   - override /model: simplefold
   - override /model/architecture: foldingdit_100M
   - override /model/sampler: euler_maruyama
@@ -21,22 +21,24 @@ defaults:
   - override /logger: tensorboard
 
 # load_ckpt_path: [PATH_TO_YOUR_CKPT] # uncomment to load a checkpoint
+load_ckpt_path: /e/project1/crescendo/reim1/ml-simplefold/artifacts/checkpoints/last-v1.ckpt
 seed: 12345
 
 trainer:
   max_steps: 300000
   val_check_interval: 10000 # this controls BOTH checkpoint steps and validation
-  accumulate_grad_batches: 1 # gradient accumulation
+  accumulate_grad_batches: 4 # push effective batch size to 512 for reproduction
+  # profiler: # options: [simple, advanced, pprof, pytorch, xla]
 
 data:
-  batch_size: 4 # should be the same as the number of GPUs
-  num_workers: 0
+  batch_size: 4 # must match num gpus
+  num_workers: 2
 
 model:
   _target_: model.simplefold.SimpleFold
   ema_decay: 0.999
   clip_grad_norm_val: 2.0
-  esm_model: "prot_t5"
+  esm_model: esm2_650M
   lddt_weight_schedule: False # set to True in finetuning phase
 
   scheduler:
@@ -52,4 +54,4 @@ model:
   processor:
     scale: 16.0
     ref_scale: 5.0
-    multiplicity: 16 # number of copies per GPU
+    multiplicity: 32

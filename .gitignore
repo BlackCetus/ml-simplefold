@@ -6,3 +6,6 @@ slurm/log/
 data/
 redis-server
 outputs/
+ccd.rdb
+bin/
+train.log

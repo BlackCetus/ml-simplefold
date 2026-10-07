@@ -694,7 +694,6 @@ class SimpleFold(pl.LightningModule):
         )
 
     def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
-
         if isinstance(
             self.trainer.strategy, lightning.pytorch.strategies.fsdp.FSDPStrategy
         ):
@@ -702,20 +701,36 @@ class SimpleFold(pl.LightningModule):
             with FullyShardedDataParallel.summon_full_params(
                 self.trainer.strategy.model, with_grads=True
             ):
+                try:
+                    clip_grad_norm_(
+                        self.trainer.strategy.model.model.parameters(),
+                        self.hparams.clip_grad_norm_val,
+                        norm_type=2.0,
+                        error_if_nonfinite=True,
+                    )
+                except RuntimeError as e:
+                    if "non-finite" not in str(e):
+                        raise
+                    print(f"Runtime error during gradient clipping: {e}. Skipping optimizer step for this batch.")
+                    for param_group in optimizer.param_groups:
+                        for param in param_group['params']:
+                            param.grad = None  # Clear gradients to avoid optimizer step
+
+        else:
+            try:
                 clip_grad_norm_(
-                    self.trainer.strategy.model.model.parameters(),
+                    self.model.parameters(),
                     self.hparams.clip_grad_norm_val,
                     norm_type=2.0,
                     error_if_nonfinite=True,
                 )
-
-        else:
-            clip_grad_norm_(
-                self.model.parameters(),
-                self.hparams.clip_grad_norm_val,
-                norm_type=2.0,
-                error_if_nonfinite=True,
-            )
+            except RuntimeError as e:
+                if "non-finite" not in str(e):
+                    raise
+                print(f"Runtime error during gradient clipping: {e}. Skipping optimizer step for this batch.")
+                for param_group in optimizer.param_groups:
+                    for param in param_group['params']:
+                        param.grad = None  # Clear gradients to avoid optimizer step
         return
 
     def on_before_zero_grad(self, optimizer: Optimizer) -> None:
@@ -761,8 +776,13 @@ class SimpleFold(pl.LightningModule):
         if not isinstance(
             self.trainer.strategy, lightning.pytorch.strategies.fsdp.FSDPStrategy
         ):
-            self.training_gpus = checkpoint["hyper_parameters"]["training_gpus"]
-            self.fwd_flops = checkpoint["hyper_parameters"]["fwd_flops"]
+            # These keys exist in Apple's released checkpoints but not in ones saved
+            # by this repo (fwd_flops is never written here; training_gpus is set at
+            # setup()). Neither is used elsewhere, so default them so resume works.
+            self.training_gpus = checkpoint["hyper_parameters"].get(
+                "training_gpus", getattr(self.trainer, "world_size", 1)
+            )
+            self.fwd_flops = checkpoint["hyper_parameters"].get("fwd_flops", None)
 
         if checkpoint["loops"] is not None:
 

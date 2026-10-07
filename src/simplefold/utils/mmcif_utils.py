@@ -378,6 +378,15 @@ def compute_interfaces(atom_data: np.ndarray, chain_data: np.ndarray) -> np.ndar
 ####################################################################################################
 
 
+class ComponentNotFoundError(Exception):
+    """Raised when a CCD reference component is not available.
+
+    Used to distinguish a missing reference-chemistry entry (e.g. an
+    unknown ligand such as ``UNL``) from other parsing failures, so the
+    caller can skip only that subchain rather than the whole structure.
+    """
+
+
 def parse_ccd_residue(  # noqa: PLR0915, C901
     name: str,
     components: dict[str, Mol],
@@ -420,7 +429,10 @@ def parse_ccd_residue(  # noqa: PLR0915, C901
         orig_idx = None
 
     # Get reference component
-    ref_mol = components[name]
+    try:
+        ref_mol = components[name]
+    except KeyError as e:
+        raise ComponentNotFoundError(name) from e
 
     # Remove hydrogens
     ref_mol = AllChem.RemoveHs(ref_mol, sanitize=False)
@@ -654,7 +666,10 @@ def parse_polymer(  # noqa: C901, PLR0915, PLR0912
             continue
 
         # Load regular residues
-        ref_mol = components[res_name]
+        try:
+            ref_mol = components[res_name]
+        except KeyError as e:
+            raise ComponentNotFoundError(res_name) from e
         ref_mol = AllChem.RemoveHs(ref_mol, sanitize=False)
         ref_conformer = get_conformer(ref_mol)
 
@@ -763,7 +778,7 @@ def parse_connection(
     connection: gemmi.Connection,
     chains: list[ParsedChain],
     subchain_map: dict[tuple[str, int], str],
-) -> ParsedConnection:
+) -> Optional[ParsedConnection]:
     """Parse (covalent) connection from a gemmi Connection.
 
     Parameters
@@ -791,36 +806,43 @@ def parse_connection(
     res_2_id = connection.partner2.res_id.seqid
     res_2_id = str(res_2_id.num) + str(res_2_id.icode).strip()
 
-    subchain_1 = subchain_map[(chain_1_name, res_1_id)]
-    subchain_2 = subchain_map[(chain_2_name, res_2_id)]
+    # A covalent connection is optional bond annotation, not structural
+    # geometry. If any partner residue/atom can't be resolved (e.g. it
+    # references an atom dropped during parsing), skip just this
+    # connection instead of failing the whole structure.
+    try:
+        subchain_1 = subchain_map[(chain_1_name, res_1_id)]
+        subchain_2 = subchain_map[(chain_2_name, res_2_id)]
 
-    # Get chain indices
-    chain_1 = next(chain for chain in chains if (chain.name == subchain_1))
-    chain_2 = next(chain for chain in chains if (chain.name == subchain_2))
+        # Get chain indices
+        chain_1 = next(chain for chain in chains if (chain.name == subchain_1))
+        chain_2 = next(chain for chain in chains if (chain.name == subchain_2))
 
-    # Get residue indices
-    res_1_idx, res_1 = next(
-        (idx, res)
-        for idx, res in enumerate(chain_1.residues)
-        if (res.orig_idx == res_1_id)
-    )
-    res_2_idx, res_2 = next(
-        (idx, res)
-        for idx, res in enumerate(chain_2.residues)
-        if (res.orig_idx == res_2_id)
-    )
+        # Get residue indices
+        res_1_idx, res_1 = next(
+            (idx, res)
+            for idx, res in enumerate(chain_1.residues)
+            if (res.orig_idx == res_1_id)
+        )
+        res_2_idx, res_2 = next(
+            (idx, res)
+            for idx, res in enumerate(chain_2.residues)
+            if (res.orig_idx == res_2_id)
+        )
 
-    # Get atom indices
-    atom_index_1 = next(
-        idx
-        for idx, atom in enumerate(res_1.atoms)
-        if atom.name == connection.partner1.atom_name
-    )
-    atom_index_2 = next(
-        idx
-        for idx, atom in enumerate(res_2.atoms)
-        if atom.name == connection.partner2.atom_name
-    )
+        # Get atom indices
+        atom_index_1 = next(
+            idx
+            for idx, atom in enumerate(res_1.atoms)
+            if atom.name == connection.partner1.atom_name
+        )
+        atom_index_2 = next(
+            idx
+            for idx, atom in enumerate(res_2.atoms)
+            if atom.name == connection.partner2.atom_name
+        )
+    except (KeyError, StopIteration):
+        return None
 
     conn = ParsedConnection(
         chain_1=subchain_1,
@@ -870,18 +892,23 @@ def parse_mmcif(
     # Load structure object
     structure = gemmi.make_structure_from_block(block)
 
-    # Clean up the structure
+    # Merge chain parts before expanding the assembly
     structure.merge_chain_parts()
-    structure.remove_waters()
-    structure.remove_hydrogens()
-    structure.remove_alternative_conformations()
-    structure.remove_empty_chains()
 
-    # Expand assembly 1
+    # Expand assembly 1 while all referenced subchains still exist.
+    # This must happen before the cleanup below, since the assembly
+    # definition may reference subchains (e.g. waters) that the cleanup
+    # would otherwise remove, causing "no subchain X" errors.
     if use_assembly and structure.assemblies:
         how = gemmi.HowToNameCopiedChain.AddNumber
         assembly_name = structure.assemblies[0].name
         structure.transform_to_assembly(assembly_name, how=how)
+
+    # Clean up the structure
+    structure.remove_waters()
+    structure.remove_hydrogens()
+    structure.remove_alternative_conformations()
+    structure.remove_empty_chains()
 
     # Create mapping from chain, residue to subchains
     # since a Connection uses the chains and not subchins
@@ -902,15 +929,22 @@ def parse_mmcif(
         # entity_type = entity.entity_type.name
         sequence = raw_chain.extract_sequence()
 
-        # Add polymer if successful
-        parsed_polymer = parse_polymer(
-            polymer=raw_chain,
-            polymer_type=gemmi.PolymerType.PeptideL,
-            sequence=sequence,
-            chain_id=subchain_id,
-            entity=str(i),
-            components=components,
-        )
+        # Add polymer if successful. Skip only this subchain if it relies
+        # on a CCD component we don't have (e.g. an unknown ligand like
+        # UNL); such a subchain is unrepresentable and would otherwise
+        # sink the whole structure. Any other error still propagates.
+        try:
+            parsed_polymer = parse_polymer(
+                polymer=raw_chain,
+                polymer_type=gemmi.PolymerType.PeptideL,
+                sequence=sequence,
+                chain_id=subchain_id,
+                entity=str(i),
+                components=components,
+            )
+        except ComponentNotFoundError as e:
+            print(f"Skipping subchain {subchain_id}: missing CCD component {e}")
+            continue
         if parsed_polymer is not None:
             chains.append(parsed_polymer)
             chain_seqs.append(parsed_polymer.sequence)
@@ -933,7 +967,8 @@ def parse_mmcif(
             chains=chains,
             subchain_map=subchain_map,
         )
-        connections.append(parsed_connection)
+        if parsed_connection is not None:
+            connections.append(parsed_connection)
 
     # Create tables
     atom_data = []

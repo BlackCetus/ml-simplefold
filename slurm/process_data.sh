@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:4          
-#SBATCH --time=0-12:00:00
+#SBATCH --time=0-00:30:00
 #SBATCH --chdir=/e/project1/crescendo/reim1/ml-simplefold
 
 set -euo pipefail
@@ -22,7 +22,6 @@ export TORCH_DISTRIBUTED_DEBUG=DETAIL
 export NCCL_DEBUG=WARN
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
-export OMP_NUM_THREADS=1
 mkdir -p "$UV_CACHE_DIR" "$TRITON_HOME"
 
 source /e/project1/crescendo/reim1/ml-simplefold/.venv/bin/activate

@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 import torch.multiprocessing
 torch.multiprocessing.set_sharing_strategy('file_system')
 
+from boltz_data_pipeline import const
 from boltz_data_pipeline.tokenize.tokenizer import Tokenizer
 from boltz_data_pipeline.feature.featurizer import BoltzFeaturizer
 from boltz_data_pipeline.filter.dynamic.filter import DynamicFilter
@@ -28,6 +29,16 @@ from utils.datamodule_utils import (
     load_input,
     collate,
     extract_sequence_from_tokens,
+)
+
+# The training data was built from OpenFold's pdb_mmcif.zip (the full PDB), which
+# includes DNA/RNA and protein-nucleic entries (e.g. the PDB *d series). SimpleFold's
+# process_mmcif.py hardcodes every chain as protein (gemmi PeptideL), so mol_type is
+# always PROTEIN and the tokenizer's non-protein-chain skip never fires; nucleotide
+# residues leak into this protein-only pipeline and crash extract_sequence_from_tokens.
+# res_type is reliable, so detect nucleic-acid residues by token id and skip the sample.
+_NUCLEOTIDE_TOKEN_IDS = np.array(
+    [const.token_ids[t] for t in ("A", "G", "C", "U", "N", "DA", "DG", "DC", "DT", "DN")]
 )
 
 
@@ -126,32 +137,19 @@ class SimpleFoldTrainingDataset(torch.utils.data.Dataset):
             # Use the record_id directly
             record_id = record_ids
 
-        # load record
-        record = json.load(
-            open(os.path.join(dataset.tokenized_dir, "records", f"{record_id.lower()}.json"), "r")
-        )
-        record = Record(**record)
-
-        # load tokenized data
-        tokenized_path = os.path.join(
-            dataset.tokenized_dir, "tokens", f"{record.id}.pkl"
-        )
-        try:
-            with open(tokenized_path, "rb") as f:
-                tokenized = pickle.load(f)
-        except:
-            # print(f"Failed to load tokenized data for {record.id}. Skipping.")
-            # return self.__getitem__(random.randint(0, self.num_samples - 1))
-            try:
-                input_data = load_input(record, dataset.target_dir)
-                tokenized = dataset.tokenizer.tokenize(input_data)
-            except:
-                print(f"Failed tokenize {record.id}")
-                return self.__getitem__(random.randint(0, self.num_samples - 1))
+        # load record + tokenized (from a webdataset archive if present, else loose files)
+        record, tokenized = self._load_sample(dataset, record_id)
+        if tokenized is None:
+            return self.__getitem__(random.randint(0, self.num_samples - 1))
 
         max_num_tokens = len(tokenized.tokens)
         if max_num_tokens == 0:
             print(f"No tokens in {record.id}. Skipping.")
+            return self.__getitem__(random.randint(0, self.num_samples - 1))
+
+        # Skip nucleic-acid structures that leak in via the always-PROTEIN mol_type
+        # (see _NUCLEOTIDE_TOKEN_IDS above). This is a protein-only model.
+        if np.isin(tokenized.tokens["res_type"], _NUCLEOTIDE_TOKEN_IDS).any():
             return self.__getitem__(random.randint(0, self.num_samples - 1))
 
         # Compute crop
@@ -203,6 +201,52 @@ class SimpleFoldTrainingDataset(torch.utils.data.Dataset):
             return self.__getitem__(random.randint(0, self.num_samples - 1))
 
         return features
+
+    def _archive_for(self, dataset):
+        """Return an ArchiveReader if dataset.tokenized_dir is a webdataset archive
+        (contains index.json), else None. Cached per tokenized_dir, built lazily so
+        each DataLoader worker opens its own tar handles after fork."""
+        cache = getattr(self, "_archive_cache", None)
+        if cache is None:
+            cache = self._archive_cache = {}
+        key = str(dataset.tokenized_dir)
+        if key not in cache:
+            if (Path(dataset.tokenized_dir) / "index.json").exists():
+                from datasets.archive import ArchiveReader
+                cache[key] = ArchiveReader(dataset.tokenized_dir)
+            else:
+                cache[key] = None
+        return cache[key]
+
+    def _load_sample(self, dataset, record_id):
+        """Load (Record, Tokenized) for one id. Returns (None, None) on failure so
+        the caller resamples. Reads from a webdataset archive when present."""
+        reader = self._archive_for(dataset)
+        if reader is not None:
+            try:
+                record = Record(**reader.record(record_id.lower()))
+                tokenized = reader.tokenized(record.id)
+            except Exception as e:
+                print(f"Archive load failed for {record_id}: {e}")
+                return None, None
+            return record, tokenized
+
+        # loose-file layout (original behavior)
+        record = Record(**json.load(
+            open(os.path.join(dataset.tokenized_dir, "records", f"{record_id.lower()}.json"), "r")
+        ))
+        tokenized_path = os.path.join(dataset.tokenized_dir, "tokens", f"{record.id}.pkl")
+        try:
+            with open(tokenized_path, "rb") as f:
+                tokenized = pickle.load(f)
+        except:
+            try:
+                input_data = load_input(record, dataset.target_dir)
+                tokenized = dataset.tokenizer.tokenize(input_data)
+            except:
+                print(f"Failed tokenize {record.id}")
+                return None, None
+        return record, tokenized
 
     def __len__(self) -> int:
         return self.num_samples
